@@ -11,6 +11,7 @@ import os
 import re
 import ssl
 import time
+from datetime import datetime, timezone
 
 from agent.redact import redact_sensitive_text
 
@@ -400,10 +401,18 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         )
 
     last_result = None
+    # Discord: handle all chunks at once (supports forum auto-detection).
+    if platform == Platform.DISCORD:
+        last_result = await _send_discord_chunks(pconfig.token, chat_id, chunks, thread_id=thread_id)
+        if isinstance(last_result, dict) and last_result.get("error"):
+            return last_result
+        if warning and isinstance(last_result, dict) and last_result.get("success"):
+            warnings = list(last_result.get("warnings", []))
+            warnings.append(warning)
+            last_result["warnings"] = warnings
+        return last_result
     for chunk in chunks:
-        if platform == Platform.DISCORD:
-            result = await _send_discord(pconfig.token, chat_id, chunk, thread_id=thread_id)
-        elif platform == Platform.SLACK:
+        if platform == Platform.SLACK:
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
@@ -597,6 +606,100 @@ async def _send_discord(token, chat_id, message, thread_id=None):
                     return _error(f"Discord API error ({resp.status}): {body}")
                 data = await resp.json()
         return {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": data.get("id")}
+    except Exception as e:
+        return _error(f"Discord send failed: {e}")
+
+
+# Discord channel types that cannot receive messages directly.
+_FORUM_LIKE_CHANNEL_TYPES = {15, 16}  # GuildForum, GuildMedia
+
+
+def _derive_forum_thread_name(text: str) -> str:
+    """Derive a forum thread/post title from the first non-empty line of text.
+
+    Discord thread names are capped at 100 characters.
+    Falls back to an ISO timestamp if the text is empty.
+    """
+    first_line = next((line.strip() for line in text.split("\n") if line.strip()), "")
+    return first_line[:100] or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+
+
+async def _send_discord_chunks(token, chat_id, chunks, thread_id=None):
+    """Send multiple message chunks to Discord, auto-creating forum posts when needed.
+
+    When the target channel is a forum (type 15) or media gallery (type 16),
+    automatically creates a thread/post with the first chunk as starter content
+    and sends remaining chunks as follow-up messages.
+
+    For regular channels or when thread_id is already set, sends all chunks
+    sequentially to the target.
+    """
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+
+    try:
+        from gateway.platforms.base import resolve_proxy_url, proxy_kwargs_for_aiohttp
+        _proxy = resolve_proxy_url(platform_env_var="DISCORD_PROXY")
+        _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+        headers = {"Authorization": f"Bot {token}", "Content-Type": "application/json"}
+        base_url = "https://discord.com/api/v10"
+
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
+            # If no thread_id, check if target is a forum/media channel.
+            channel_type = None
+            if not thread_id:
+                async with session.get(f"{base_url}/channels/{chat_id}", headers=headers, **_req_kw) as resp:
+                    if resp.status == 200:
+                        channel_data = await resp.json()
+                        channel_type = channel_data.get("type")
+
+            if channel_type in _FORUM_LIKE_CHANNEL_TYPES and not thread_id:
+                # Forum/Media channel: create a thread post with the first chunk.
+                thread_name = _derive_forum_thread_name(chunks[0] if chunks else "")
+                starter_content = chunks[0] if chunks else thread_name
+                thread_payload = {
+                    "name": thread_name,
+                    "message": {"content": starter_content},
+                }
+                async with session.post(
+                    f"{base_url}/channels/{chat_id}/threads",
+                    headers=headers,
+                    json=thread_payload,
+                    **_req_kw,
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        body = await resp.text()
+                        return _error(f"Discord forum thread creation failed ({resp.status}): {body}")
+                    thread_data = await resp.json()
+                thread_id = str(thread_data["id"])
+                message_id = thread_data.get("message", {}).get("id")
+                remaining_chunks = chunks[1:]
+            else:
+                # Regular channel or existing thread: send all chunks sequentially.
+                remaining_chunks = chunks
+                message_id = None
+
+            # Send remaining chunks to the target (thread or channel).
+            target_id = thread_id or chat_id
+            for chunk in remaining_chunks:
+                async with session.post(
+                    f"{base_url}/channels/{target_id}/messages",
+                    headers=headers,
+                    json={"content": chunk},
+                    **_req_kw,
+                ) as resp:
+                    if resp.status not in (200, 201):
+                        body = await resp.text()
+                        return _error(f"Discord API error ({resp.status}): {body}")
+                    data = await resp.json()
+                    message_id = data.get("id")
+
+        result = {"success": True, "platform": "discord", "chat_id": chat_id, "message_id": message_id}
+        if thread_id:
+            result["thread_id"] = thread_id
+        return result
     except Exception as e:
         return _error(f"Discord send failed: {e}")
 

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m pytest tests/tools/test_send_message_tool.py -v --tb=short)"
+    ]
+  }
+}

@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 import threading
 import time
+from datetime import datetime, timezone
 from collections import defaultdict
 from typing import Callable, Dict, Optional, Any
 
@@ -768,10 +769,14 @@ class DiscordAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None
     ) -> SendResult:
-        """Send a message to a Discord channel or thread.
+        """Send a message to a Discord channel, thread, or forum.
 
         When metadata contains a thread_id, the message is sent to that
         thread instead of the parent channel identified by chat_id.
+
+        When the target is a ForumChannel, automatically creates a thread/post
+        with the first chunk as starter content and sends remaining chunks
+        as follow-up messages.
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
@@ -801,6 +806,26 @@ class DiscordAdapter(BasePlatformAdapter):
             formatted = self.format_message(content)
             chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
+            # Forum/Media channel: create a thread post, then send to it.
+            if not thread_id and self._is_forum_parent(channel):
+                thread_name = self._derive_forum_thread_name(formatted)
+                starter = chunks[0] if chunks else thread_name
+                try:
+                    thread = await channel.create_thread(name=thread_name, content=starter)
+                except Exception as e:
+                    logger.error("[%s] Failed to create forum post in %s: %s", self.name, chat_id, e, exc_info=True)
+                    return SendResult(success=False, error=f"Forum thread creation failed: {e}")
+                message_ids = [str(thread.id)]
+                for chunk in chunks[1:]:
+                    msg = await thread.send(content=chunk)
+                    message_ids.append(str(msg.id))
+                return SendResult(
+                    success=True,
+                    message_id=message_ids[0],
+                    raw_response={"message_ids": message_ids, "thread_id": str(thread.id)},
+                )
+
+            # Regular channel or existing thread.
             message_ids = []
             reference = None
 
@@ -2197,6 +2222,16 @@ class DiscordAdapter(BasePlatformAdapter):
             if type_value == 15:
                 return True
         return False
+
+    @staticmethod
+    def _derive_forum_thread_name(text: str) -> str:
+        """Derive a forum post title from the first non-empty line of text.
+
+        Discord thread names are capped at 100 characters.
+        Falls back to an ISO timestamp if the text is empty.
+        """
+        first_line = next((line.strip() for line in text.split("\n") if line.strip()), "")
+        return first_line[:100] or datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M")
 
     def _get_effective_topic(self, channel: Any, is_thread: bool = False) -> Optional[str]:
         """Return the channel topic, falling back to the parent forum's topic for forum threads."""
