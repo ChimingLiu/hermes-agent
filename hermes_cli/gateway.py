@@ -715,12 +715,23 @@ def _detect_venv_dir() -> Path | None:
     """Detect the active virtualenv directory.
 
     Checks ``sys.prefix`` first (works regardless of the directory name),
-    then falls back to probing common directory names under PROJECT_ROOT.
+    then ``VIRTUAL_ENV`` env var (covers uv-managed environments where
+    sys.prefix == sys.base_prefix), then falls back to probing common
+    directory names under PROJECT_ROOT.
     Returns ``None`` when no virtualenv can be found.
     """
     # If we're running inside a virtualenv, sys.prefix points to it.
     if sys.prefix != sys.base_prefix:
         venv = Path(sys.prefix)
+        if venv.is_dir():
+            return venv
+
+    # uv and some other tools set VIRTUAL_ENV without changing sys.prefix.
+    # This catches `uv run` where sys.prefix == sys.base_prefix but the
+    # environment IS a venv.  (#8620)
+    _virtual_env = os.environ.get("VIRTUAL_ENV")
+    if _virtual_env:
+        venv = Path(_virtual_env)
         if venv.is_dir():
             return venv
 
@@ -2919,6 +2930,15 @@ def gateway_command(args):
 
     elif subcmd == "start":
         system = getattr(args, 'system', False)
+        start_all = getattr(args, 'all', False)
+
+        if start_all:
+            # Kill all stale gateway processes across all profiles before starting
+            killed = kill_gateway_processes(all_profiles=True)
+            if killed:
+                print(f"✓ Killed {killed} stale gateway process(es) across all profiles")
+                _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+
         if is_termux():
             print("Gateway service start is not supported on Termux because there is no system service manager.")
             print("Run manually: hermes gateway")
@@ -3004,7 +3024,39 @@ def gateway_command(args):
         # Try service first, fall back to killing and restarting
         service_available = False
         system = getattr(args, 'system', False)
+        restart_all = getattr(args, 'all', False)
         service_configured = False
+
+        if restart_all:
+            # --all: stop every gateway process across all profiles, then start fresh
+            service_stopped = False
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+                try:
+                    systemd_stop(system=system)
+                    service_stopped = True
+                except subprocess.CalledProcessError:
+                    pass
+            elif is_macos() and get_launchd_plist_path().exists():
+                try:
+                    launchd_stop()
+                    service_stopped = True
+                except subprocess.CalledProcessError:
+                    pass
+            killed = kill_gateway_processes(all_profiles=True)
+            total = killed + (1 if service_stopped else 0)
+            if total:
+                print(f"✓ Stopped {total} gateway process(es) across all profiles")
+            _wait_for_gateway_exit(timeout=10.0, force_after=5.0)
+
+            # Start the current profile's service fresh
+            print("Starting gateway...")
+            if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
+                systemd_start(system=system)
+            elif is_macos() and get_launchd_plist_path().exists():
+                launchd_start()
+            else:
+                run_gateway(verbose=0)
+            return
         
         if supports_systemd_services() and (get_systemd_unit_path(system=False).exists() or get_systemd_unit_path(system=True).exists()):
             service_configured = True
