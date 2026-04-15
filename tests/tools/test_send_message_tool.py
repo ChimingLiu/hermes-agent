@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from gateway.config import Platform
 from tools.send_message_tool import (
+    _derive_forum_thread_name,
     _parse_target_ref,
     _send_discord,
     _send_telegram,
@@ -854,3 +855,227 @@ class TestSendToPlatformDiscordThread:
         send_mock.assert_awaited_once()
         _, call_kwargs = send_mock.await_args
         assert call_kwargs["thread_id"] is None
+
+
+# ---------------------------------------------------------------------------
+# Tests for _derive_forum_thread_name
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveForumThreadName:
+    def test_single_line_message(self):
+        assert _derive_forum_thread_name("Hello world") == "Hello world"
+
+    def test_multi_line_uses_first_line(self):
+        assert _derive_forum_thread_name("First line\nSecond line") == "First line"
+
+    def test_strips_markdown_heading(self):
+        assert _derive_forum_thread_name("## My Heading") == "My Heading"
+
+    def test_strips_multiple_hash_levels(self):
+        assert _derive_forum_thread_name("### Deep heading") == "Deep heading"
+
+    def test_empty_message_falls_back_to_default(self):
+        assert _derive_forum_thread_name("") == "New Post"
+
+    def test_whitespace_only_falls_back(self):
+        assert _derive_forum_thread_name("   \n  ") == "New Post"
+
+    def test_hash_only_falls_back(self):
+        assert _derive_forum_thread_name("###") == "New Post"
+
+    def test_truncates_to_100_chars(self):
+        long_title = "A" * 200
+        result = _derive_forum_thread_name(long_title)
+        assert len(result) == 100
+
+    def test_strips_whitespace_around_first_line(self):
+        assert _derive_forum_thread_name("  Title  \nBody") == "Title"
+
+
+# ---------------------------------------------------------------------------
+# Tests for _send_discord with forum channel support
+# ---------------------------------------------------------------------------
+
+
+class TestSendDiscordForum:
+    """_send_discord creates thread posts for forum channels."""
+
+    @staticmethod
+    def _build_mock(response_status, response_data=None, response_text="error body"):
+        mock_resp = MagicMock()
+        mock_resp.status = response_status
+        mock_resp.json = AsyncMock(return_value=response_data or {})
+        mock_resp.text = AsyncMock(return_value=response_text)
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=None)
+
+        mock_session = MagicMock()
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=None)
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.get = MagicMock(return_value=mock_resp)
+
+        return mock_session, mock_resp
+
+    def test_directory_forum_creates_thread(self):
+        """Directory says 'forum' — creates a thread post."""
+        thread_data = {
+            "id": "t123",
+            "message": {"id": "m456"},
+        }
+        mock_session, _ = self._build_mock(200, response_data=thread_data)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("gateway.channel_directory.lookup_channel_type", return_value="forum"):
+            result = asyncio.run(
+                _send_discord("tok", "forum_ch", "Hello forum")
+            )
+
+        assert result["success"] is True
+        assert result["thread_id"] == "t123"
+        assert result["message_id"] == "m456"
+        # Should POST to threads endpoint, not messages
+        call_url = mock_session.post.call_args.args[0]
+        assert "/threads" in call_url
+        assert "/messages" not in call_url
+
+    def test_directory_forum_skips_probe(self):
+        """When directory says 'forum', no GET probe is made."""
+        thread_data = {"id": "t123", "message": {"id": "m456"}}
+        mock_session, _ = self._build_mock(200, response_data=thread_data)
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("gateway.channel_directory.lookup_channel_type", return_value="forum"):
+            asyncio.run(
+                _send_discord("tok", "forum_ch", "Hello")
+            )
+
+        # get() should never be called — directory resolved the type
+        mock_session.get.assert_not_called()
+
+    def test_directory_channel_skips_forum(self):
+        """When directory says 'channel', sends via normal messages endpoint."""
+        mock_session, _ = self._build_mock(200, response_data={"id": "msg1"})
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("gateway.channel_directory.lookup_channel_type", return_value="channel"):
+            result = asyncio.run(
+                _send_discord("tok", "ch1", "Hello")
+            )
+
+        assert result["success"] is True
+        call_url = mock_session.post.call_args.args[0]
+        assert "/messages" in call_url
+        assert "/threads" not in call_url
+
+    def test_directory_none_probes_and_detects_forum(self):
+        """When directory has no entry, probes GET /channels/{id} and detects type 15."""
+        probe_resp = MagicMock()
+        probe_resp.status = 200
+        probe_resp.json = AsyncMock(return_value={"type": 15})
+        probe_resp.__aenter__ = AsyncMock(return_value=probe_resp)
+        probe_resp.__aexit__ = AsyncMock(return_value=None)
+
+        thread_data = {"id": "t999", "message": {"id": "m888"}}
+        thread_resp = MagicMock()
+        thread_resp.status = 200
+        thread_resp.json = AsyncMock(return_value=thread_data)
+        thread_resp.text = AsyncMock(return_value="")
+        thread_resp.__aenter__ = AsyncMock(return_value=thread_resp)
+        thread_resp.__aexit__ = AsyncMock(return_value=None)
+
+        probe_session = MagicMock()
+        probe_session.__aenter__ = AsyncMock(return_value=probe_session)
+        probe_session.__aexit__ = AsyncMock(return_value=None)
+        probe_session.get = MagicMock(return_value=probe_resp)
+
+        thread_session = MagicMock()
+        thread_session.__aenter__ = AsyncMock(return_value=thread_session)
+        thread_session.__aexit__ = AsyncMock(return_value=None)
+        thread_session.post = MagicMock(return_value=thread_resp)
+
+        session_iter = iter([probe_session, thread_session])
+
+        with patch("aiohttp.ClientSession", side_effect=lambda **kw: next(session_iter)), \
+             patch("gateway.channel_directory.lookup_channel_type", return_value=None):
+            result = asyncio.run(
+                _send_discord("tok", "forum_ch", "Hello probe")
+            )
+
+        assert result["success"] is True
+        assert result["thread_id"] == "t999"
+
+    def test_directory_lookup_exception_falls_through_to_probe(self):
+        """When lookup_channel_type raises, falls through to API probe."""
+        mock_session, _ = self._build_mock(200, response_data={"id": "msg1"})
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("gateway.channel_directory.lookup_channel_type", side_effect=Exception("io error")):
+            result = asyncio.run(
+                _send_discord("tok", "ch1", "Hello")
+            )
+
+        assert result["success"] is True
+        # Falls through to probe (GET)
+        mock_session.get.assert_called_once()
+
+    def test_forum_thread_creation_error(self):
+        """Forum thread creation returning non-200/201 returns an error dict."""
+        mock_session, _ = self._build_mock(403, response_text="Forbidden")
+
+        with patch("aiohttp.ClientSession", return_value=mock_session), \
+             patch("gateway.channel_directory.lookup_channel_type", return_value="forum"):
+            result = asyncio.run(
+                _send_discord("tok", "forum_ch", "Hello")
+            )
+
+        assert "error" in result
+        assert "403" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# Tests for _send_to_platform with forum channel detection
+# ---------------------------------------------------------------------------
+
+
+class TestSendToPlatformDiscordForum:
+    """_send_to_platform delegates forum detection to _send_discord."""
+
+    def test_send_to_platform_discord_delegates_to_send_discord(self):
+        """Discord messages are routed through _send_discord, which handles forum detection."""
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_discord", send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "forum_ch",
+                    "Hello forum",
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once_with(
+            "tok", "forum_ch", "Hello forum", thread_id=None,
+        )
+
+    def test_send_to_platform_discord_with_thread_id(self):
+        """Thread ID is still passed through when sending to Discord."""
+        send_mock = AsyncMock(return_value={"success": True, "message_id": "1"})
+
+        with patch("tools.send_message_tool._send_discord", send_mock):
+            result = asyncio.run(
+                _send_to_platform(
+                    Platform.DISCORD,
+                    SimpleNamespace(enabled=True, token="tok", extra={}),
+                    "ch1",
+                    "Hello thread",
+                    thread_id="17585",
+                )
+            )
+
+        assert result["success"] is True
+        _, call_kwargs = send_mock.await_args
+        assert call_kwargs["thread_id"] == "17585"
