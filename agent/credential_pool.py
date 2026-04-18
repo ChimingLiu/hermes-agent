@@ -1162,6 +1162,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             if token:
                 source_name = "gh_cli" if "gh" in source.lower() else f"env:{source}"
                 active_sources.add(source_name)
+                pconfig = PROVIDER_REGISTRY.get(provider)
                 changed |= _upsert_entry(
                     entries,
                     provider,
@@ -1170,6 +1171,7 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                         "source": source_name,
                         "auth_type": AUTH_TYPE_API_KEY,
                         "access_token": token,
+                        "base_url": pconfig.inference_base_url if pconfig else "",
                         "label": source,
                     },
                 )
@@ -1206,6 +1208,19 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
             logger.debug("Qwen OAuth token seed failed: %s", exc)
 
     elif provider == "openai-codex":
+        # Respect user suppression — `hermes auth remove openai-codex` marks
+        # the device_code source as suppressed so it won't be re-seeded from
+        # either the Hermes auth store or ~/.codex/auth.json.  Without this
+        # gate the removal is instantly undone on the next load_pool() call.
+        codex_suppressed = False
+        try:
+            from hermes_cli.auth import is_source_suppressed
+            codex_suppressed = is_source_suppressed(provider, "device_code")
+        except ImportError:
+            pass
+        if codex_suppressed:
+            return changed, active_sources
+
         state = _load_provider_state(auth_store, "openai-codex")
         tokens = state.get("tokens") if isinstance(state, dict) else None
         # Fallback: import from Codex CLI (~/.codex/auth.json) if Hermes auth

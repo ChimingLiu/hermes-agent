@@ -87,6 +87,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                aliases=("bg",), args_hint="<prompt>"),
     CommandDef("btw", "Ephemeral side question using session context (no tools, not persisted)", "Session",
                args_hint="<question>"),
+    CommandDef("agents", "Show active agents and running tasks", "Session",
+               aliases=("tasks",)),
     CommandDef("queue", "Queue a prompt for the next turn (doesn't interrupt)", "Session",
                aliases=("q",), args_hint="<prompt>"),
     CommandDef("status", "Show session info", "Session"),
@@ -99,9 +101,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Configuration
     CommandDef("config", "Show current configuration", "Configuration",
                cli_only=True),
-    CommandDef("model", "Switch model for this session", "Configuration", args_hint="[model] [--global]"),
+    CommandDef("model", "Switch model for this session", "Configuration", args_hint="[model] [--provider name] [--global]"),
     CommandDef("provider", "Show available providers and current provider",
                "Configuration"),
+    CommandDef("gquota", "Show Google Gemini Code Assist quota usage", "Info"),
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
@@ -119,7 +122,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[normal|fast|status]",
                subcommands=("normal", "fast", "status", "on", "off")),
     CommandDef("skin", "Show or change the display skin/theme", "Configuration",
-               cli_only=True, args_hint="[name]"),
+               args_hint="[name]"),
     CommandDef("voice", "Toggle voice mode", "Configuration",
                args_hint="[on|off|tts|status]", subcommands=("on", "off", "tts", "status")),
 
@@ -154,7 +157,9 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[days]"),
     CommandDef("platforms", "Show gateway/messaging platform status", "Info",
                cli_only=True, aliases=("gateway",)),
-    CommandDef("paste", "Check clipboard for an image and attach it", "Info",
+    CommandDef("copy", "Copy the last assistant response to clipboard", "Info",
+               cli_only=True, args_hint="[number]"),
+    CommandDef("paste", "Attach clipboard image from your clipboard", "Info",
                cli_only=True),
     CommandDef("image", "Attach a local image file for your next prompt", "Info",
                cli_only=True, args_hint="<path>"),
@@ -164,7 +169,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",
-               cli_only=True, aliases=("exit", "q")),
+               cli_only=True, aliases=("exit",)),
 ]
 
 
@@ -450,7 +455,7 @@ def _collect_gateway_skill_entries(
             name = sanitize_name(cmd_name) if sanitize_name else cmd_name
             if not name:
                 continue
-            desc = "Plugin command"
+            desc = plugin_cmds[cmd_name].get("description", "Plugin command")
             if len(desc) > desc_limit:
                 desc = desc[:desc_limit - 3] + "..."
             plugin_pairs.append((name, desc))
@@ -1043,6 +1048,51 @@ class SlashCommandCompleter(Completer):
                 display_meta=f"{fp}  {meta}" if meta else fp,
             )
 
+    @staticmethod
+    def _skin_completions(sub_text: str, sub_lower: str):
+        """Yield completions for /skin from available skins."""
+        try:
+            from hermes_cli.skin_engine import list_skins
+            for s in list_skins():
+                name = s["name"]
+                if name.startswith(sub_lower) and name != sub_lower:
+                    yield Completion(
+                        name,
+                        start_position=-len(sub_text),
+                        display=name,
+                        display_meta=s.get("description", "") or s.get("source", ""),
+                    )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _personality_completions(sub_text: str, sub_lower: str):
+        """Yield completions for /personality from configured personalities."""
+        try:
+            from hermes_cli.config import load_config
+            personalities = load_config().get("agent", {}).get("personalities", {})
+            if "none".startswith(sub_lower) and "none" != sub_lower:
+                yield Completion(
+                    "none",
+                    start_position=-len(sub_text),
+                    display="none",
+                    display_meta="clear personality overlay",
+                )
+            for name, prompt in personalities.items():
+                if name.startswith(sub_lower) and name != sub_lower:
+                    if isinstance(prompt, dict):
+                        meta = prompt.get("description") or prompt.get("system_prompt", "")[:50]
+                    else:
+                        meta = str(prompt)[:50]
+                    yield Completion(
+                        name,
+                        start_position=-len(sub_text),
+                        display=name,
+                        display_meta=meta,
+                    )
+        except Exception:
+            pass
+
     def _model_completions(self, sub_text: str, sub_lower: str):
         """Yield completions for /model from config aliases + built-in aliases."""
         seen = set()
@@ -1097,10 +1147,17 @@ class SlashCommandCompleter(Completer):
             sub_text = parts[1] if len(parts) > 1 else ""
             sub_lower = sub_text.lower()
 
-            # Dynamic model alias completions for /model
-            if " " not in sub_text and base_cmd == "/model":
-                yield from self._model_completions(sub_text, sub_lower)
-                return
+            # Dynamic completions for commands with runtime lists
+            if " " not in sub_text:
+                if base_cmd == "/model":
+                    yield from self._model_completions(sub_text, sub_lower)
+                    return
+                if base_cmd == "/skin":
+                    yield from self._skin_completions(sub_text, sub_lower)
+                    return
+                if base_cmd == "/personality":
+                    yield from self._personality_completions(sub_text, sub_lower)
+                    return
 
             # Static subcommand completions
             if " " not in sub_text and base_cmd in SUBCOMMANDS and self._command_allowed(base_cmd):
@@ -1138,6 +1195,22 @@ class SlashCommandCompleter(Completer):
                     display=cmd,
                     display_meta=f"⚡ {short_desc}",
                 )
+
+        # Plugin-registered slash commands
+        try:
+            from hermes_cli.plugins import get_plugin_commands
+            for cmd_name, cmd_info in get_plugin_commands().items():
+                if cmd_name.startswith(word):
+                    desc = str(cmd_info.get("description", "Plugin command"))
+                    short_desc = desc[:50] + ("..." if len(desc) > 50 else "")
+                    yield Completion(
+                        self._completion_text(cmd_name, word),
+                        start_position=-len(word),
+                        display=f"/{cmd_name}",
+                        display_meta=f"🔌 {short_desc}",
+                    )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------

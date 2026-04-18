@@ -12,6 +12,15 @@ sys.modules.setdefault("fal_client", types.SimpleNamespace())
 import run_agent
 
 
+@pytest.fixture(autouse=True)
+def _no_codex_backoff(monkeypatch):
+    """Short-circuit retry backoff so Codex retry tests don't block on real
+    wall-clock waits (5s jittered_backoff base delay + tight time.sleep loop)."""
+    import time as _time
+    monkeypatch.setattr(run_agent, "jittered_backoff", lambda *a, **k: 0.0)
+    monkeypatch.setattr(_time, "sleep", lambda *_a, **_k: None)
+
+
 def _patch_agent_bootstrap(monkeypatch):
     monkeypatch.setattr(
         run_agent,
@@ -256,6 +265,23 @@ def test_copilot_acp_stays_on_chat_completions_for_gpt_5_models(monkeypatch):
         skip_memory=True,
     )
     assert agent.provider == "copilot-acp"
+    assert agent.api_mode == "chat_completions"
+
+
+def test_copilot_gpt_5_mini_stays_on_chat_completions(monkeypatch):
+    _patch_agent_bootstrap(monkeypatch)
+    agent = run_agent.AIAgent(
+        model="gpt-5-mini",
+        base_url="https://api.githubcopilot.com",
+        provider="copilot",
+        api_key="gh-token",
+        api_mode="chat_completions",
+        quiet_mode=True,
+        max_iterations=1,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+    assert agent.provider == "copilot"
     assert agent.api_mode == "chat_completions"
 
 
