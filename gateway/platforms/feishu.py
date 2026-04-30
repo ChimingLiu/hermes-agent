@@ -209,6 +209,8 @@ _FEISHU_WEBHOOK_BODY_TIMEOUT_SECONDS = 30          # max seconds to read request
 _FEISHU_WEBHOOK_ANOMALY_THRESHOLD = 25             # consecutive error responses before WARNING log
 _FEISHU_WEBHOOK_ANOMALY_TTL_SECONDS = 6 * 60 * 60  # anomaly tracker TTL (6 hours) — matches openclaw
 _FEISHU_CARD_ACTION_DEDUP_TTL_SECONDS = 15 * 60    # card action token dedup window (15 min)
+_FEISHU_MODEL_PICKER_TTL_SECONDS = 10 * 60         # model-picker state TTL (10 min)
+_FEISHU_MODEL_PAGE_SIZE = 8                        # models shown per provider page (matches Telegram)
 
 _APPROVAL_CHOICE_MAP: Dict[str, str] = {
     "approve_once": "once",
@@ -1363,6 +1365,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        # Interactive model-picker state (sid → picker context); keyed by a short
+        # hash of the session_key because Feishu button ``value`` dicts have a
+        # 300-byte cap and full session keys can exceed it.
+        self._model_picker_state: Dict[str, Dict[str, Any]] = {}
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
@@ -1811,6 +1817,355 @@ class FeishuAdapter(BasePlatformAdapter):
                 },
             ],
         }
+
+    # =========================================================================
+    # Model picker — interactive card drill-down (provider → model → confirm)
+    # =========================================================================
+
+    @staticmethod
+    def _make_picker_sid(session_key: str) -> str:
+        # Feishu button value dicts cap at 300 bytes; full session keys can
+        # exceed that once echoed into multiple buttons.
+        return hashlib.sha1(session_key.encode("utf-8")).hexdigest()[:12]
+
+    def _prune_picker_state(self) -> None:
+        now = time.time()
+        stale = [
+            sid for sid, st in self._model_picker_state.items()
+            if now - float(st.get("created_at", now)) > _FEISHU_MODEL_PICKER_TTL_SECONDS
+        ]
+        for sid in stale:
+            self._model_picker_state.pop(sid, None)
+
+    @staticmethod
+    def _provider_label(slug: str) -> str:
+        try:
+            from hermes_cli.providers import get_label
+        except ImportError:
+            return slug
+        return get_label(slug)
+
+    @staticmethod
+    def _chunk_buttons(buttons: List[Dict[str, Any]], per_row: int = 2) -> List[Dict[str, Any]]:
+        return [
+            {"tag": "action", "actions": buttons[i : i + per_row]}
+            for i in range(0, len(buttons), per_row)
+        ]
+
+    @staticmethod
+    def _picker_button(label: str, value: Dict[str, Any], btn_type: str = "default") -> Dict[str, Any]:
+        return {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": label},
+            "type": btn_type,
+            "value": value,
+        }
+
+    @classmethod
+    def _picker_nav_row(cls, sid: str, include_back: bool) -> Dict[str, Any]:
+        actions: List[Dict[str, Any]] = []
+        if include_back:
+            actions.append(cls._picker_button("◀ Back", {"hermes_picker": "back", "sid": sid}))
+        actions.append(cls._picker_button("✗ Cancel", {"hermes_picker": "cancel", "sid": sid}, "danger"))
+        return {"tag": "action", "actions": actions}
+
+    @staticmethod
+    def _picker_card(*, title: str, template: str, elements: List[Dict[str, Any]]) -> Dict[str, Any]:
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": title, "tag": "plain_text"},
+                "template": template,
+            },
+            "elements": elements,
+        }
+
+    @classmethod
+    def _build_provider_card(
+        cls,
+        *,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        sid: str,
+    ) -> Dict[str, Any]:
+        header_md = (
+            f"Current model: `{current_model or 'unknown'}`\n"
+            f"Provider: {cls._provider_label(current_provider)}\n\n"
+            f"**Select a provider:**"
+        )
+        buttons: List[Dict[str, Any]] = []
+        for p in providers:
+            slug = p.get("slug") or ""
+            name = p.get("name") or slug or "provider"
+            count = p.get("total_models", len(p.get("models") or []))
+            label = f"{name} ({count})"
+            if p.get("is_current"):
+                label = f"✓ {label}"
+            buttons.append(cls._picker_button(
+                label,
+                {"hermes_picker": "provider", "slug": slug, "sid": sid},
+                "primary" if p.get("is_current") else "default",
+            ))
+
+        elements: List[Dict[str, Any]] = [{"tag": "markdown", "content": header_md}]
+        elements.extend(cls._chunk_buttons(buttons))
+        elements.append(cls._picker_nav_row(sid, include_back=False))
+        return cls._picker_card(title="⚙ Model Configuration", template="blue", elements=elements)
+
+    @classmethod
+    def _build_model_card(
+        cls,
+        *,
+        provider: Dict[str, Any],
+        sid: str,
+        page_size: int = _FEISHU_MODEL_PAGE_SIZE,
+    ) -> Dict[str, Any]:
+        slug = provider.get("slug") or ""
+        name = provider.get("name") or slug or "provider"
+        models = list(provider.get("models") or [])
+        total = int(provider.get("total_models", len(models)))
+        shown = models[:page_size]
+
+        if not shown:
+            md = (
+                f"Provider: **{name}**\n\n"
+                f"_No models available. Type `/model <name> --provider {slug}` to pick one directly._"
+            )
+            elements = [{"tag": "markdown", "content": md}, cls._picker_nav_row(sid, include_back=True)]
+            return cls._picker_card(title="⚙ Model Configuration", template="blue", elements=elements)
+
+        more_hint = ""
+        if total > len(shown):
+            more_hint = f"\n_{total - len(shown)} more available — type `/model <name>` directly_"
+
+        elements: List[Dict[str, Any]] = [{
+            "tag": "markdown",
+            "content": (
+                f"Provider: **{name}**\n\n"
+                f"**Select a model:**{more_hint}\n"
+                f"_(session only — use `/model <name> --global` to persist)_"
+            ),
+        }]
+
+        buttons: List[Dict[str, Any]] = []
+        for model_id in shown:
+            short = model_id.split("/")[-1] if "/" in model_id else model_id
+            if len(short) > 38:
+                short = short[:35] + "..."
+            buttons.append(cls._picker_button(
+                short,
+                {"hermes_picker": "model", "slug": slug, "model": model_id, "sid": sid},
+            ))
+        elements.extend(cls._chunk_buttons(buttons))
+        elements.append(cls._picker_nav_row(sid, include_back=True))
+        return cls._picker_card(title="⚙ Model Configuration", template="blue", elements=elements)
+
+    @classmethod
+    def _build_picker_status_card(cls, *, title: str, template: str, body: str) -> Dict[str, Any]:
+        return cls._picker_card(
+            title=title,
+            template=template,
+            elements=[{"tag": "markdown", "content": body}],
+        )
+
+    async def send_model_picker(
+        self,
+        chat_id: str,
+        providers: list,
+        current_model: str,
+        current_provider: str,
+        session_key: str,
+        on_model_selected,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send an interactive drill-down picker: provider → model → confirm."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        self._prune_picker_state()
+
+        try:
+            sid = self._make_picker_sid(session_key)
+            card = self._build_provider_card(
+                providers=providers,
+                current_model=current_model,
+                current_provider=current_provider,
+                sid=sid,
+            )
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "send_model_picker failed")
+            if not result.success:
+                return result
+
+            self._model_picker_state[sid] = {
+                "providers": providers,
+                "on_model_selected": on_model_selected,
+                "current_model": current_model,
+                "current_provider": current_provider,
+                "chat_id": chat_id,
+                "metadata": metadata,
+                "created_at": time.time(),
+            }
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] send_model_picker failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    def _picker_response(self, card_data: Optional[Dict[str, Any]] = None) -> Any:
+        """Build a P2CardActionTriggerResponse, optionally carrying an inline card update."""
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if card_data is not None and CallBackCard is not None:
+            card = CallBackCard()
+            card.type = "raw"
+            card.data = card_data
+            response.card = card
+        return response
+
+    def _handle_picker_card_action(
+        self,
+        *,
+        action_value: Dict[str, Any],
+        loop: Any,
+    ) -> Any:
+        picker_action = action_value.get("hermes_picker")
+        sid = str(action_value.get("sid") or "")
+        state = self._model_picker_state.get(sid) if sid else None
+
+        if not state:
+            return self._picker_response(self._build_picker_status_card(
+                title="⚠️ Model picker",
+                template="orange",
+                body="_Picker expired — run `/model` again to refresh._",
+            ))
+
+        handler = self._PICKER_HANDLERS.get(picker_action)
+        if handler is None:
+            return self._picker_response()
+        return handler(self, state, sid, action_value, loop)
+
+    def _picker_handle_cancel(self, state, sid, action_value, loop):
+        self._model_picker_state.pop(sid, None)
+        return self._picker_response(self._build_picker_status_card(
+            title="Model selection cancelled", template="grey", body="_Cancelled._",
+        ))
+
+    def _picker_handle_back(self, state, sid, action_value, loop):
+        card = self._build_provider_card(
+            providers=state["providers"],
+            current_model=state.get("current_model", ""),
+            current_provider=state.get("current_provider", ""),
+            sid=sid,
+        )
+        return self._picker_response(card)
+
+    def _picker_handle_provider(self, state, sid, action_value, loop):
+        slug = str(action_value.get("slug") or "")
+        provider = next((p for p in state["providers"] if p.get("slug") == slug), None)
+        if not provider:
+            return self._picker_response(self._build_picker_status_card(
+                title="⚠️ Model picker", template="orange", body="_Provider not found._",
+            ))
+        models = list(provider.get("models") or [])
+        if len(models) == 1:
+            return self._dispatch_picker_model_selection(
+                sid=sid, state=state, provider_slug=slug, model_id=models[0], loop=loop,
+            )
+        return self._picker_response(self._build_model_card(provider=provider, sid=sid))
+
+    def _picker_handle_model(self, state, sid, action_value, loop):
+        slug = str(action_value.get("slug") or "")
+        model_id = str(action_value.get("model") or "")
+        if not slug or not model_id:
+            return self._picker_response(self._build_picker_status_card(
+                title="⚠️ Model picker", template="orange", body="_Invalid selection._",
+            ))
+        return self._dispatch_picker_model_selection(
+            sid=sid, state=state, provider_slug=slug, model_id=model_id, loop=loop,
+        )
+
+    _PICKER_HANDLERS = {
+        "cancel": _picker_handle_cancel,
+        "back": _picker_handle_back,
+        "provider": _picker_handle_provider,
+        "model": _picker_handle_model,
+    }
+
+    def _dispatch_picker_model_selection(
+        self,
+        *,
+        sid: str,
+        state: Dict[str, Any],
+        provider_slug: str,
+        model_id: str,
+        loop: Any,
+    ) -> Any:
+        callback = state.get("on_model_selected")
+        self._model_picker_state.pop(sid, None)
+
+        if callback is None:
+            return self._picker_response(self._build_picker_status_card(
+                title="⚠️ Model picker", template="orange",
+                body="_Picker state lost. Run `/model` again._",
+            ))
+
+        self._submit_on_loop(
+            loop,
+            self._run_picker_model_switch(
+                chat_id=str(state.get("chat_id") or ""),
+                model_id=model_id,
+                provider_slug=provider_slug,
+                callback=callback,
+                metadata=state.get("metadata"),
+            ),
+        )
+        # Inline placeholder keeps the card responsive; the real confirmation
+        # arrives as a follow-up message once the callback resolves.
+        placeholder = self._build_picker_status_card(
+            title="✅ Model Switched",
+            template="green",
+            body=f"Switching to `{model_id}` on **{self._provider_label(provider_slug)}**…",
+        )
+        return self._picker_response(placeholder)
+
+    async def _run_picker_model_switch(
+        self,
+        *,
+        chat_id: str,
+        model_id: str,
+        provider_slug: str,
+        callback,
+        metadata: Optional[Dict[str, Any]],
+    ) -> None:
+        try:
+            result_text = await callback(chat_id, model_id, provider_slug)
+        except Exception as exc:
+            logger.error("[Feishu] Model picker switch callback failed: %s", exc, exc_info=True)
+            result_text = f"Error switching model: {exc}"
+
+        try:
+            card = self._build_picker_status_card(
+                title="✅ Model Switched",
+                template="green",
+                body=result_text or "Model switched.",
+            )
+            await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="interactive",
+                payload=json.dumps(card, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+        except Exception as exc:
+            logger.warning("[Feishu] Failed to send model-switch confirmation: %s", exc)
 
     async def send_voice(
         self,
@@ -2311,9 +2666,13 @@ class FeishuAdapter(BasePlatformAdapter):
         action = getattr(event, "action", None)
         action_value = getattr(action, "value", {}) or {}
         hermes_action = action_value.get("hermes_action") if isinstance(action_value, dict) else None
+        hermes_picker = action_value.get("hermes_picker") if isinstance(action_value, dict) else None
 
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
+
+        if hermes_picker:
+            return self._handle_picker_card_action(action_value=action_value, loop=loop)
 
         self._submit_on_loop(loop, self._handle_card_action_event(data))
         if P2CardActionTriggerResponse is None:
