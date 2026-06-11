@@ -1,0 +1,8 @@
+name: command-interceptor
+version: 1.0.0
+description: "Intercept and block specific tool calls with configurable match rules. Supports regex, substring, and exact match modes. Optionally logs blocked calls to an audit file and can dispatch follow-up tools on block."
+author: "ChimingLiu"
+kind: standalone
+hooks:
+  - pre_tool_call
+  - post_tool_call
